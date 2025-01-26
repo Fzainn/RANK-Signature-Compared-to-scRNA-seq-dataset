@@ -1,0 +1,293 @@
+---
+title: "RANK compared with scRNA-seq"
+output: html_document
+date: "2025-01-22"
+---
+```{r}
+##################### Step 1: Load RANK Signature Data and Map Genes ########################
+
+setwd("C:\\Users\\DELL\\Downloads")
+
+#load the required packages
+remotes::install_github("mojaveazure/seurat-disk", force = TRUE)
+install.packages("anndata")
+
+
+BiocManager::install("zellkonverter")
+# Install ComplexHeatmap
+BiocManager::install("ComplexHeatmap")
+library(zellkonverter)
+library(sceasy)
+library(Seurat)
+library(SeuratDisk)
+library(reticulate)
+library(anndata)
+library(data.table)
+library(rtracklayer)
+library(pheatmap)
+library(ComplexHeatmap)
+library(anndata)
+library(Matrix)
+library(gridExtra)
+library(ggplot2)
+
+py_config()
+py_run_string("import pip; print(pip.__version__)")
+py_install("scanpy")
+
+sc <- import("scanpy")
+
+
+
+# Load RANK signature data
+rank_signature <- read.csv("filtered_data.csv")
+
+# Extract gene names as a vector
+rank_signature_genes <- rank_signature$Geneid
+
+# Import GTF file
+gtf <- rtracklayer::import('Homo_sapiens.GRCh38.113.gtf.gz')
+
+#convert gtf to df
+gtf_df <- as.data.frame(gtf)
+
+# Extract gene information (gene_id and gene_name)
+gene_info <- gtf_df[gtf_df$type == "gene", c("gene_id", "gene_name")]
+
+# Map RANK signature gene symbols to Ensembl IDs
+rank_signature_mapped <- gene_info[gene_info$gene_name %in% rank_signature_genes, ]
+
+# Extract Ensembl IDs
+rank_signature_genesIDS <- rank_signature_mapped$gene_id
+
+```
+
+```{r}
+
+
+######################### Step 2: Load and Subset scRNA-seq Data Using Python ######################
+
+# Run Python code to load and subset the scRNA-seq data
+py_run_string("
+import scanpy as sc
+
+# Load the .h5ad file in backed mode to save memory
+adata = sc.read_h5ad('scRNA-Epithelial.h5ad', backed='r')
+
+# Subset the data to include only RANK signature genes
+rank_signature_genesIDS = r.rank_signature_genesIDS  # Access R vector in Python
+adata_subset = adata[:, rank_signature_genesIDS].to_memory()  # Move subset to memory
+
+# Print the shape of the subsetted data
+print(adata_subset.shape)
+")
+
+# Transfer the subsetted AnnData object to R
+adata_subset <- py$adata_subset
+
+# Extract the subsetted expression matrix
+expression_matrix <- py_to_r(adata_subset$X)
+expression_matrix <- as.matrix(expression_matrix)
+
+
+# Check which genes are missing
+missing_genes <- setdiff(rank_signature_genesIDS, py_to_r(adata_subset$var_names))
+print(missing_genes)
+
+```
+
+
+
+```{r}
+
+########################## Step 3: Match Ensembl IDs and Assign Gene Symbols ##########################
+
+# Match Ensembl IDs and assign gene symbols as column names
+colnames(expression_matrix) <- rank_signature_mapped$gene_name[match(rank_signature_genesIDS, rank_signature_mapped$gene_id)]
+
+# Check for NA values in column names
+print(sum(is.na(colnames(expression_matrix))))
+
+# Check the result
+head(colnames(expression_matrix))
+
+```
+
+```{r}
+
+
+####################### Step 4: Convert to Dense Matrix and Create Seurat Object ####################
+
+# Convert to a dense matrix
+expression_matrix_dense <- as.matrix(expression_matrix)
+
+# Check the class of the new object
+class(expression_matrix_dense) 
+
+
+expression_matrix_dense <- t(expression_matrix_dense)
+
+dim(expression_matrix_dense)
+
+
+
+# Create Seurat object
+seurat_obj <- CreateSeuratObject(counts = expression_matrix_dense)
+
+print(seurat_obj)
+
+# Normalize data
+seurat_obj <- NormalizeData(seurat_obj)
+
+# Find variable features
+seurat_obj <- FindVariableFeatures(seurat_obj, nfeatures = 2000)
+
+
+
+# Scale data
+seurat_obj <- ScaleData(seurat_obj)
+
+```
+
+
+```{r}
+################################### Step 5: Dimensionality Reduction and Clustering ##################
+
+# Use all 21 genes for clustering (without PCA)
+seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(seurat_obj), npcs = 21)
+
+subset_seurat <- subset(seurat_obj, cells = 1:1000)
+subset_seurat <- FindNeighbors(subset_seurat, reduction = "pca", dims = 1:5, k.param = 10, graph.name = "pca_nn")
+
+subset_seurat <- FindClusters(subset_seurat, resolution = 0.5, graph.name = "pca_nn")
+
+
+head(subset_seurat$seurat_clusters)
+
+
+
+subset_seurat <- RunUMAP(subset_seurat, dims = 1:5)
+
+# Visualize clusters
+DimPlot(subset_seurat, reduction = "umap", group.by = "seurat_clusters")
+
+```
+
+
+```{r} 
+
+
+
+########################### Step 6: Validate Gene Expression and Plot ###########################
+
+
+missing_genes <- setdiff(rank_signature_genes, rownames(subset_seurat))
+print(missing_genes)
+
+# Remove missing genes from the signature list
+rank_signature_genes <- intersect(rank_signature_genes, rownames(subset_seurat))
+
+# Calculate the percentage of cells expressing each gene
+gene_expression_percentage <- rowSums(GetAssayData(subset_seurat, slot = "counts") > 0) / ncol(subset_seurat) * 100
+
+
+# Filter out genes with no or very low expression (e.g., < 1% of cells)
+expressed_genes <- names(gene_expression_percentage[gene_expression_percentage >= 1])
+rank_signature_genes <- intersect(rank_signature_genes, expressed_genes)
+
+
+# Plot expression of the remaining genes
+FeaturePlot(subset_seurat, features = rank_signature_genes, ncol = 3)
+
+cluster_markers <- FindAllMarkers(subset_seurat)
+View(cluster_markers)
+
+# Save the cluster markers as a CSV file
+write.csv(cluster_markers, file = "cluster_markers.csv", row.names = FALSE)
+
+
+
+# AUC scores can be visualized on a UMAP or t-SNE plot to see how the signature activity is distributed across cells.
+# Create a list to store the feature plots
+feature_plots <- list()
+
+# Loop through each gene in rank_signature_genes and generate the plots
+for (gene in rank_signature_genes) {
+  p <- FeaturePlot(subset_seurat, features = gene, label = TRUE) +
+    ggtitle(paste("Expression of", gene))
+  feature_plots[[gene]] <- p  # Add the plot to the list
+}
+
+# Combine all feature plots into a grid
+combined_plots <- marrangeGrob(feature_plots, nrow = 2, ncol = 2)  # 2 rows and 2 columns per page
+
+# Save the combined plots as a PDF
+ggsave(filename = "Feature_Plots.pdf", plot = combined_plots, width = 12, height = 8, dpi = 300)
+
+
+
+```
+
+```{r}
+
+######################## Step 7: Calculate Signature Scores ######################
+
+BiocManager::install("AUCell")
+library(AUCell)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+
+
+# Step 1: Extract the expression matrix
+expression_matrix <- as.matrix(GetAssayData(subset_seurat, slot = "counts"))
+
+# Step 2: Calculate AUC scores for the signature
+auc_scores <- AUCell::AUCell_run(expression_matrix, list(RANK_signature = rank_signature_genes))
+
+# Step 3: Extract AUC scores for the RANK_signature
+rank_signature_auc_scores <- auc_scores@assays@data$AUC["RANK_signature", ]
+
+# Step 4: Verify the AUC scores
+length(rank_signature_auc_scores) == ncol(subset_seurat)  # Should return TRUE
+all(names(rank_signature_auc_scores) == colnames(subset_seurat))  # Should return TRUE
+
+# Step 5: Add AUC scores to the Seurat object
+subset_seurat$RANK_signature_AUC <- rank_signature_auc_scores
+head(subset_seurat@meta.data)
+
+# Step 6: Visualize the AUC scores
+feature_plot <- FeaturePlot(subset_seurat, features = "RANK_signature_AUC", label = TRUE) +
+  ggtitle("RANK Signature AUC Score") +
+  theme_minimal() +
+  scale_color_gradient(low = "lightgray", high = "red")
+
+# Step 7: Save the Seurat object
+saveRDS(subset_seurat, file = "subset_seurat_with_RANK_signature_AUC.rds")
+
+# Step 8: Analyze the distribution of AUC scores
+summary(subset_seurat$RANK_signature_AUC)
+hist_plot <- ggplot(data = subset_seurat@meta.data, aes(x = RANK_signature_AUC)) +
+  geom_histogram(bins = 50, fill = "blue", color = "black") +
+  ggtitle("Distribution of RANK Signature AUC Scores") +
+  xlab("AUC Score") +
+  ylab("Frequency") +
+  theme_minimal()
+
+# Step 9:Compare AUC scores between cell clusters to identify clusters with high signature activity.
+cluster_auc_comparison <- subset_seurat@meta.data %>%
+  group_by(seurat_clusters) %>%
+  summarise(mean_auc = mean(RANK_signature_AUC))
+print(cluster_auc_comparison)
+
+# Step 10: Combine the histogram and UMAP plot
+combined_plots <- hist_plot / feature_plot  # Arrange vertically
+
+# Step 11: Save the combined plots as a PDF
+ggsave(filename = "RANK_Signature_Analysis_Plots.pdf", plot = combined_plots, width = 12, height = 16, dpi = 300)
+
+
+```
+
+
