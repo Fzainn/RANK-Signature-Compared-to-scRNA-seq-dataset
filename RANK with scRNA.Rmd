@@ -281,6 +281,8 @@ cluster_auc_comparison <- subset_seurat@meta.data %>%
   summarise(mean_auc = mean(RANK_signature_AUC))
 print(cluster_auc_comparison)
 
+write.csv(cluster_auc_comparison, file = "cluster_auc_comparison.csv", row.names = FALSE)
+
 # Step 10: Combine the histogram and UMAP plot
 combined_plots <- hist_plot / feature_plot  # Arrange vertically
 
